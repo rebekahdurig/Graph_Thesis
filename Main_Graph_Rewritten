@@ -1,0 +1,572 @@
+"""
+Graph Automaton - PySide6 + NetworkX
+=====================================
+An interactive graph editor with cellular automaton dynamics.
+Click empty space to add nodes, click two nodes to add an edge.
+Press SPACEBAR to advance time one step.
+
+Dependencies:
+    pip install PySide6 networkx numpy galois
+"""
+
+
+##TODO:
+"""
+Change colors to improve readability
+Mobius Function may theoretically run into issues with very specific numbers - for example if a number has a factorization of n=(2*large_prime1)*(3*large_prime2)
+    where sqrt(n) < large_prime1 and sqrt(n) < large_prime2, then my algorithm assumes (large_prime1 * large_prime2) is prime instead of composite
+    Online Python implimentations of Mobius function have more bugs than my version, from experiments
+"""
+
+import sys
+import numpy as np
+import networkx as nx
+import math
+import galois
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout,
+    QHBoxLayout, QLabel, QPushButton, QGraphicsView,
+    QGraphicsScene, QGraphicsEllipseItem, QGraphicsLineItem,
+    QStatusBar, QFrame
+)
+from PySide6.QtCore import Qt, QPointF, QRectF
+from PySide6.QtGui import QPen, QBrush, QColor, QFont, QPainter
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONSTANTS
+# ─────────────────────────────────────────────────────────────────────────────
+
+NODE_RADIUS = 14
+NODE_COLOR_OFF = QColor("#4a4e69")       # Color when node state == 0
+NODE_COLOR_ON  = QColor("#f2a65a")       # Color when node state == 1
+NODE_BORDER    = QColor("#ffffff")
+EDGE_COLOR     = QColor("#9a8c98")
+SELECTED_COLOR = QColor("#c77dff")
+
+BACKGROUND_COLOR = "#1a1a2e"
+PANEL_COLOR      = "#16213e"
+TEXT_COLOR       = "#e0e0e0"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AUTOMATON RULES  ← YOUR MAIN CUSTOMIZATION POINT
+# ─────────────────────────────────────────────────────────────────────────────
+
+def compute_next_state(current_state: int, live_neighbor_count: int, total_neighbor_count: int, mod: int = 2) -> int:
+    """
+    Determine the next state (0 or 1) for a node.
+
+    This is where YOU define the rules of your automaton.
+    The function is called once per node per time step.
+
+    Parameters
+    ----------
+    current_state : int
+        The node's current state — 0 (off) or 1 (on).
+    live_neighbor_count : int
+        How many of this node's direct neighbors are currently ON (state == 1).
+    total_neighbor_count : int
+        The total number of neighbors this node has (its degree).
+        Useful for ratio-based or degree-sensitive rules.
+
+    Returns
+    -------
+    int
+        The node's next state: 0 or 1.
+    """
+
+    # ── Game of Light (GOL) Rules ──────────────
+    if current_state == 1:
+        #Calculates the modulo of the non-live neighbors
+        return (total_neighbor_count-live_neighbor_count) % mod
+    else:
+        return live_neighbor_count % mod
+    # ── END GOL Rules ───────────────────────────────────────────────────
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# INITIAL STATE ASSIGNMENT  ← SECOND CUSTOMIZATION POINT
+# ─────────────────────────────────────────────────────────────────────────────
+
+def initial_state_for_new_node(graph: nx.Graph, node_id: int) -> int:
+    return 0 
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GRAPH DATA MODEL
+# ─────────────────────────────────────────────────────────────────────────────
+
+class GraphModel:
+    """
+    Wraps a NetworkX graph and exposes the operations the UI needs.
+    All graph-theory logic lives here; the view never touches nx directly.
+    """
+
+    def __init__(self, mod: int):
+        self.G = nx.Graph()
+        self._next_id = 0
+        self.mod = mod
+        self.GF = galois.GF(mod)
+
+    # ── Node operations ───────────────────────────────────────────────────
+
+    def add_node(self, x: float, y: float) -> int:
+        nid = self._next_id
+        state = initial_state_for_new_node(self.G, nid)
+        self.G.add_node(nid, x=x, y=y, state=state)
+        self._next_id += 1
+        return nid
+
+    def remove_node(self, nid: int):
+        if nid in self.G:
+            self.G.remove_node(nid)
+
+    def toggle_node_state(self, nid: int):
+        """Manually flip a node's state (useful for setup / debugging)."""
+        if nid in self.G:
+            self.G.nodes[nid]['state'] ^= 1
+
+    def remove_isolated_nodes(self):
+        """Delete all nodes that have no edges."""
+        isolated = list(nx.isolates(self.G))
+        self.G.remove_nodes_from(isolated)
+        return len(isolated)
+
+    # ── Edge operations ───────────────────────────────────────────────────
+
+    def add_edge(self, u: int, v: int):
+        if u != v and not self.G.has_edge(u, v):
+            self.G.add_edge(u, v)
+            return True
+        return False
+
+    def remove_edge(self, u: int, v: int):
+        if self.G.has_edge(u, v):
+            self.G.remove_edge(u, v)
+
+    # ── Automaton step ────────────────────────────────────────────────────
+
+    def step(self):
+        """
+        Advance the automaton by one time step.
+        All nodes are updated simultaneously (synchronous update).
+
+        If you want ASYNCHRONOUS update (nodes update one at a time in
+        some order), replace this method with a loop that updates each
+        node and immediately writes the result back to self.G.
+        """
+        new_states = {}
+        for nid in self.G.nodes:
+            neighbors = list(self.G.neighbors(nid))
+            live = sum(self.G.nodes[n]['state'] for n in neighbors)
+            total = len(neighbors)
+            new_states[nid] = compute_next_state(
+                self.G.nodes[nid]['state'], live, total, self.mod
+            )
+        nx.set_node_attributes(self.G, new_states, 'state')
+
+    # ── Matrix / stats ────────────────────────────────────────────────────
+
+    def adjacency_matrix(self) -> np.ndarray:
+        """Returns the adjacency matrix as a numpy array."""
+        return self.GF(nx.to_numpy_array(self.G, dtype = int))
+    
+    def harmonic_matrix(self) -> np.ndarray:
+        """Defines a harmonic operator as in section 3 of paper"""
+        A = self.adjacency_matrix()
+        degrees = np.array([d % self.mod for _,d in self.G.degree()])
+        D = self.GF(np.diag(degrees))
+        return (A + D)
+
+    def state_vector(self) -> np.ndarray:
+        """Returns a 1-D array of every node's current state."""
+        return np.array([self.G.nodes[n]['state'] for n in self.G.nodes])
+
+    @property
+    def node_count(self) -> int:
+        return self.G.number_of_nodes()
+
+    @property
+    def edge_count(self) -> int:
+        return self.G.number_of_edges()
+    
+    @property
+    def edges(self) -> list:
+        return self.G.edges
+
+    @property
+    def live_count(self) -> int:
+        return sum(d['state'] for _, d in self.G.nodes(data=True))
+
+    def node_at(self, x: float, y: float, radius: float = NODE_RADIUS) -> int | None:
+        """Return the id of the first node within `radius` of (x, y), or None."""
+        for nid, data in self.G.nodes(data=True):
+            dx = data['x'] - x
+            dy = data['y'] - y
+            if (dx * dx + dy * dy) ** 0.5 <= radius:
+                return nid
+        return None
+
+    def clear(self):
+        self.G.clear()
+        self._next_id = 0
+
+    def mobius(self, m): #Checked up to m=60 and producing correct results
+        if m == 1:
+            return 1
+        parity=0
+        n = m
+        # print("max loop con: ", np.sqrt(m)+1)
+        for i in np.r_[2, 3:int(np.ceil(np.sqrt(m)+1)):2]:
+            # print(i)
+            if n%i == 0:
+                parity += 1
+                # print('parity increased')
+                n = n//i
+                if n%i == 0:
+                    # print('square found')
+                    return 0
+        if n > 1: #catches when n is prime, or case where a prime factor is larger than sqrt (generally when numbers/number of factors are small, like 2*7 = 14, 2 will be caught in loop, but 7 won't)
+            # print("n not fully reduced by loop")
+            parity += 1  
+        # print("parity: ", parity)
+        return (-1)**parity
+
+    def calculate_gol(self):
+        self.remove_isolated_nodes()
+        states = self.mod**(self.node_count) #define n as number of nodes in graph
+        #Create a dictionary of keys n and a^n where A is the adjacency matrix. N should run between 1 and when dim Ker(a^n) == dim Ker(a^(n+1))
+        counter = 1
+        matrix_powers = {0:np.eye(self.node_count)}
+        matrix_ker_dims = {0:0}
+        while True:
+            matrix_power_calc = np.linalg.matrix_power(self.harmonic_matrix(), counter)
+            matrix_powers[counter] = matrix_power_calc
+            matrix_ker_dim_calc = self.node_count - np.linalg.matrix_rank(matrix_power_calc)
+            matrix_ker_dims[counter] = matrix_ker_dim_calc
+            if matrix_ker_dims[counter] <= matrix_ker_dims[counter-1]:
+                break
+            else:
+                counter+=1
+
+        tree_dict = self.calculate_trees(matrix_ker_dims)
+        print("Tree Dictionary:")
+        print(tree_dict)
+        #Update states by dividing the number of states by product of 2^i^bi (this is the maximum number of loop nodes we need to consider)
+        tree_size = math.prod(2**(tree_size * mult) for tree_size, mult in tree_dict.items())
+        states = states / tree_size
+        loops_dict = self.calculate_loops(states, self.harmonic_matrix(), matrix_powers)
+        print("Loop Dictionary: ")
+        print(loops_dict)
+        #Format output and return (print statement? something else?)
+        return None
+
+    def calculate_trees(self, matrix_ker_dict):
+        dict_size = len(matrix_ker_dict)
+        tree_dict = {}
+
+        for i in range(1, dict_size-1):
+            test_calc = 2*matrix_ker_dict[i]-matrix_ker_dict[i-1]-matrix_ker_dict[i+1]
+            if test_calc > 0:
+                tree_dict[i] = test_calc
+        return tree_dict
+
+    def calculate_loops(self, states: int, matrix, matrix_dict):
+        loop_dict = {}
+        p = 1
+        while states > 0:
+            if p > states:
+                print("Calculate Loops is broken")
+                return None
+            #write while loop for all divisors of p (i)
+            # temp_sum_array = []
+            sum = 0
+            for i in range(1,p+1):
+                if p%i != 0:
+                    continue
+                if self.mobius((p//i)) == 0:
+                    continue
+                if i not in matrix_dict:
+                    matrix_dict[i] = np.linalg.matrix_power(matrix, i)
+                
+                #Now calculate dimension of eigenspace for lambda = 1
+                #Recalculate this for other mods except Z2!!!
+                eigenspace_dim = matrix_dict[i].shape[0] - np.linalg.matrix_rank(matrix_dict[i] - self.GF(galois.Array.Identity(matrix_dict[i].shape[0]))) #eigenspace measures kernel size
+                sum += self.mobius(p//i)*(2**(eigenspace_dim))
+            if sum > 0:
+                states = states - sum
+                loop_dict[p] = int(sum/p)
+            p += 1
+        return loop_dict
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CANVAS (the interactive drawing area)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class GraphCanvas(QGraphicsView):
+    """
+    Handles all mouse interaction and drawing.
+    Communicates back to the main window via callbacks.
+    """
+
+    def __init__(self, model: GraphModel, on_change):
+        super().__init__()
+        self.model = model
+        self.on_change = on_change          # called whenever the graph changes
+        self.selected_node = None           # first node in a pending edge
+
+        self.time_step = 0
+        self._scene = QGraphicsScene(self)
+        self.setScene(self._scene)
+        self.setRenderHint(QPainter.RenderHint.Antialiasing)
+        self.setBackgroundBrush(QBrush(QColor(BACKGROUND_COLOR)))
+        self.setMinimumSize(700, 500)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+
+    # ── Mouse events ──────────────────────────────────────────────────────
+
+    def mousePressEvent(self, event):
+        pos = self.mapToScene(event.position().toPoint())
+        x, y = pos.x(), pos.y()
+
+        if event.button() == Qt.MouseButton.LeftButton:
+            hit = self.model.node_at(x, y)
+
+            if hit is None:
+                # Empty space → create a new node
+                self.model.add_node(x, y)
+                self.selected_node = None
+                self.redraw()
+                self.on_change()
+
+            else:
+                # Clicked an existing node
+                if self.selected_node is None:
+                    # First click — select it
+                    self.selected_node = hit
+                    self.redraw()
+                elif self.selected_node == hit:
+                    # Clicked the same node again — deselect
+                    self.selected_node = None
+                    self.redraw()
+                else:
+                    # Second click on a different node
+                    #if edge already exists, delete it
+                    if (self.selected_node, hit) in (self.model.edges):
+                        self.model.remove_edge(self.selected_node, hit)
+                        #reset timer if edges change
+                        self.time_step = 0
+                        self.selected_node = None
+                        self.redraw()
+                        self.on_change()
+                    #if edge doesn't exist, create it
+                    else:
+                        self.model.add_edge(self.selected_node, hit)
+                        #reset timer if edges change
+                        self.time_step = 0
+                        self.selected_node = None
+                        self.redraw()
+                        self.on_change()
+                        
+
+        elif event.button() == Qt.MouseButton.RightButton:
+            # Right-click a node to toggle its on/off state manually
+            hit = self.model.node_at(x, y)
+            if hit is not None:
+                self.model.toggle_node_state(hit)
+                #reset timer if states change
+                self.time_step = 0
+                self.redraw()
+                self.on_change()
+
+
+    # ── Drawing ───────────────────────────────────────────────────────────
+
+    def redraw(self):
+        """Clear and repaint everything from the model."""
+        self._scene.clear()
+
+        G = self.model.G
+
+        # Draw edges first (so they appear under nodes)
+        edge_pen = QPen(EDGE_COLOR, 2)
+        for u, v in G.edges():
+            x1, y1 = G.nodes[u]['x'], G.nodes[u]['y']
+            x2, y2 = G.nodes[v]['x'], G.nodes[v]['y']
+            self._scene.addLine(x1, y1, x2, y2, edge_pen)
+
+        # Draw nodes
+        for nid, data in G.nodes(data=True):
+            cx, cy = data['x'], data['y']
+            r = NODE_RADIUS
+            state = data['state']
+
+            fill = NODE_COLOR_ON if state == 1 else NODE_COLOR_OFF
+            border_color = SELECTED_COLOR if nid == self.selected_node else NODE_BORDER
+            pen = QPen(border_color, 2.5)
+            brush = QBrush(fill)
+
+            ellipse = self._scene.addEllipse(
+                cx - r, cy - r, r * 2, r * 2, pen, brush
+            )
+
+            # Draw node id label
+            label = self._scene.addText(str(nid))
+            label.setDefaultTextColor(QColor("#ffffff"))
+            label.setFont(QFont("Courier", 8))
+            label.setPos(cx - r * 0.6, cy - r * 0.7)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN WINDOW
+# ─────────────────────────────────────────────────────────────────────────────
+
+class MainWindow(QMainWindow):
+
+    def __init__(self):
+        super().__init__()
+        self.model = GraphModel(mod=2)
+
+        self.setWindowTitle("Graph Automaton")
+        self.setStyleSheet(f"background-color: {PANEL_COLOR}; color: {TEXT_COLOR};")
+
+        self._build_ui()
+        self._update_stats()
+
+    # ── UI construction ───────────────────────────────────────────────────
+
+    def _build_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QVBoxLayout(central)
+        root.setSpacing(8)
+        root.setContentsMargins(10, 10, 10, 10)
+
+        # ── Canvas ──
+        self.canvas = GraphCanvas(self.model, on_change=self._update_stats)
+        root.addWidget(self.canvas)
+
+        # ── Stats bar ──
+        stats_row = QHBoxLayout()
+        self.lbl_nodes = self._stat_label("Nodes: 0")
+        self.lbl_edges = self._stat_label("Edges: 0")
+        self.lbl_live  = self._stat_label("Live: 0")
+        self.lbl_step  = self._stat_label("Step: 0")
+        for lbl in (self.lbl_nodes, self.lbl_edges, self.lbl_live, self.lbl_step):
+            stats_row.addWidget(lbl)
+        stats_row.addStretch()
+        root.addLayout(stats_row)
+
+        # ── Buttons ──
+        btn_row = QHBoxLayout()
+
+        btn_step   = self._button("⏭  Step  [Space]", self._advance_step)
+        btn_prune  = self._button("✂  Remove Isolated", self._remove_isolated)
+        btn_matrix = self._button("🔢  Print Matrix", self._print_matrix)
+        btn_clear  = self._button("🗑  Clear All", self._clear_all)
+        btn_calc = self._button("🖩 Calculate GOL Structure", self._calculate_gol)
+
+        for btn in (btn_step, btn_prune, btn_matrix, btn_clear, btn_calc):
+            btn_row.addWidget(btn)
+
+        root.addLayout(btn_row)
+
+        # ── Instructions ──
+        hint = QLabel(
+            "Left-click empty space → add node  |  "
+            "Left-click node → select  |  "
+            "Left-click second node → add edge  |  "
+            "Right-click node → toggle state  |  "
+            "Space → advance time"
+        )
+        hint.setStyleSheet("color: #888; font-size: 11px;")
+        hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        root.addWidget(hint)
+
+    def _stat_label(self, text: str) -> QLabel:
+        lbl = QLabel(text)
+        lbl.setStyleSheet(
+            f"background: #0f3460; color: {TEXT_COLOR}; "
+            "padding: 4px 12px; border-radius: 4px; font-family: Courier;"
+        )
+        return lbl
+
+    def _button(self, text: str, slot) -> QPushButton:
+        btn = QPushButton(text)
+        btn.clicked.connect(slot)
+        btn.setStyleSheet(
+            "QPushButton {"
+            f"  background: #0f3460; color: {TEXT_COLOR};"
+            "  padding: 6px 14px; border-radius: 4px;"
+            "  font-size: 12px;"
+            "}"
+            "QPushButton:hover { background: #1a4a80; }"
+        )
+        return btn
+
+    # ── Keyboard ──────────────────────────────────────────────────────────
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Space:
+            self._advance_step()
+        else:
+            super().keyPressEvent(event)
+
+    # ── Actions ───────────────────────────────────────────────────────────
+
+    def _advance_step(self):
+        self.model.step()
+        self.canvas.time_step += 1
+        self.canvas.redraw()
+        self._update_stats()
+
+    def _remove_isolated(self):
+        n = self.model.remove_isolated_nodes()
+        self.canvas.redraw()
+        self._update_stats()
+        self.statusBar().showMessage(f"Removed {n} isolated node(s).", 3000)
+
+    def _print_matrix(self):
+        """
+        Prints the adjacency matrix and state vector to stdout.
+        You could extend this to display in a dialog, export to CSV, etc.
+        """
+        matrix = self.model.harmonic_matrix()
+        states = self.model.state_vector()
+        print("\n── Adjacency Matrix ──")
+        print(matrix)
+        print("\n── State Vector ──")
+        print(states)
+        self.statusBar().showMessage("Matrix printed to console.", 3000)
+
+    def _clear_all(self):
+        self.model.clear()
+        self.canvas.time_step = 0
+        self.canvas.selected_node = None
+        self.canvas.redraw()
+        self._update_stats()
+
+    def _update_stats(self):
+        self.lbl_nodes.setText(f"Nodes: {self.model.node_count}")
+        self.lbl_edges.setText(f"Edges: {self.model.edge_count}")
+        self.lbl_live.setText(f"Live: {self.model.live_count}")
+        self.lbl_step.setText(f"Step: {self.canvas.time_step}")
+
+    def _calculate_gol(self):
+        self.model.calculate_gol()
+        return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ENTRY POINT
+# ─────────────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+    window = MainWindow()
+    window.resize(900, 680)
+    window.show()
+    sys.exit(app.exec())
