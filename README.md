@@ -1,9 +1,9 @@
 # Graph_Thesis
 
 ## Previous Work
-This is a recode of work done for my master's thesis, which was digging more deeply into work my advisor had previously done.
-Original Paper: Harmonic Evolutions on Graphs by Jerzy Kocik (2012)
-Original Thesis: The Game of Light: A Graph Theoretic Approach by Rebekah Durig (2017)
+This is a recode of work done for my master's thesis, which was digging more deeply into work my advisor had previously done.\
+Original Paper: [Harmonic Evolutions on Graphs](https://www.semanticscholar.org/paper/Harmonic-evolutions-on-graphs-Kocik/d79984a223867ea681acf520d564bda511641691) by Jerzy Kocik (2012)\
+Original Thesis: [The Game of Light: A Graph Theoretic Approach](https://opensiuc.lib.siu.edu/theses/2199/) by Rebekah Durig (2017)
 
 The code in my thesis was originally Java-based.
 
